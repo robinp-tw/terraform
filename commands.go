@@ -188,6 +188,13 @@ func initCommands(
 			}, nil
 		},
 
+		"index": func() (cli.Command, error) {
+			return &command.IndexCommand{
+				Meta: meta,
+			}, nil
+		},
+
+
 		"init": func() (cli.Command, error) {
 			return &command.InitCommand{
 				Meta: meta,
