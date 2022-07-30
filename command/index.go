@@ -4,15 +4,19 @@ import (
 	//	"encoding/json"
 	"fmt"
 	"log"
-	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
 
 	"github.com/zclconf/go-cty/cty"
 
 	"github.com/hashicorp/hcl/v2"
+	"github.com/hashicorp/terraform/backend"
 	"github.com/hashicorp/terraform/configs"
 	"github.com/hashicorp/terraform/configs/configschema"
+	"github.com/hashicorp/terraform/dag"
 	"github.com/hashicorp/terraform/lang"
+	"github.com/hashicorp/terraform/plans"
 	"github.com/hashicorp/terraform/terraform"
 	"github.com/hashicorp/terraform/tfdiags"
 )
@@ -23,106 +27,181 @@ type IndexCommand struct {
 }
 
 func (c *IndexCommand) Run(args []string) int {
-	// Note: mostly adapted from validate.go.
-	args = c.Meta.process(args)
+	// Note: mostly adapted from graph.go.
+	var drawCycles bool
+	var graphTypeStr string
+	var moduleDepth int
+	var verbose bool
 
-	var jsonOutput bool
-	cmdFlags := c.Meta.defaultFlagSet("index")
-	cmdFlags.BoolVar(&jsonOutput, "json", false, "produce JSON output")
+	args = c.Meta.process(args)
+	cmdFlags := c.Meta.defaultFlagSet("graph")
+	cmdFlags.BoolVar(&drawCycles, "draw-cycles", false, "draw-cycles")
+	cmdFlags.StringVar(&graphTypeStr, "type", "", "type")
+	cmdFlags.IntVar(&moduleDepth, "module-depth", -1, "module-depth")
+	cmdFlags.BoolVar(&verbose, "verbose", false, "verbose")
 	cmdFlags.Usage = func() { c.Ui.Error(c.Help()) }
 	if err := cmdFlags.Parse(args); err != nil {
 		c.Ui.Error(fmt.Sprintf("Error parsing command-line flags: %s\n", err.Error()))
 		return 1
 	}
 
-	var diags tfdiags.Diagnostics
-
-	// After this point, we must only produce JSON output if JSON mode is
-	// enabled, so all errors should be accumulated into diags and we'll
-	// print out a suitable result at the end, depending on the format
-	// selection. All returns from this point on must be tail-calls into
-	// c.showResults in order to produce the expected output.
-	args = cmdFlags.Args()
-
-	var dirPath string
-	if len(args) == 1 {
-		dirPath = args[0]
-	} else {
-		dirPath = "."
-	}
-	dir, err := filepath.Abs(dirPath)
+	configPath, err := ModulePath(cmdFlags.Args())
 	if err != nil {
-		diags = diags.Append(fmt.Errorf("unable to locate module: %s", err))
-		return c.showResults(diags, jsonOutput)
+		c.Ui.Error(err.Error())
+		return 1
 	}
 
 	// Check for user-supplied plugin path
 	if c.pluginPath, err = c.loadPluginPath(); err != nil {
-		diags = diags.Append(fmt.Errorf("error loading plugin path: %s", err))
-		return c.showResults(diags, jsonOutput)
+		c.Ui.Error(fmt.Sprintf("Error loading plugin path: %s", err))
+		return 1
 	}
 
-	indexDiags := c.index(dir)
+	// Check if the path is a plan
+	var plan *plans.Plan
+	planFile, err := c.PlanFile(configPath)
+	if err != nil {
+		c.Ui.Error(err.Error())
+		return 1
+	}
+	if planFile != nil {
+		// Reset for backend loading
+		configPath = ""
+	}
+
+	var diags tfdiags.Diagnostics
+
+	backendConfig, backendDiags := c.loadBackendConfig(configPath)
+	diags = diags.Append(backendDiags)
+	if diags.HasErrors() {
+		c.showDiagnostics(diags)
+		return 1
+	}
+
+	// Load the backend
+	b, backendDiags := c.Backend(&BackendOpts{
+		Config: backendConfig,
+	})
+	diags = diags.Append(backendDiags)
+	if backendDiags.HasErrors() {
+		c.showDiagnostics(diags)
+		return 1
+	}
+
+	// We require a local backend
+	local, ok := b.(backend.Local)
+	if !ok {
+		c.showDiagnostics(diags) // in case of any warnings in here
+		c.Ui.Error(ErrUnsupportedLocalOp)
+		return 1
+	}
+
+	// This is a read-only command
+	c.ignoreRemoteBackendVersionConflict(b)
+
+	// Build the operation
+	opReq := c.Operation(b)
+	opReq.ConfigDir = configPath
+	opReq.ConfigLoader, err = c.initConfigLoader()
+	opReq.PlanFile = planFile
+	opReq.AllowUnsetVariables = true
+	if err != nil {
+		diags = diags.Append(err)
+		c.showDiagnostics(diags)
+		return 1
+	}
+
+	// Get the context
+	ctx, _, ctxDiags := local.Context(opReq)
+	diags = diags.Append(ctxDiags)
+	if ctxDiags.HasErrors() {
+		c.showDiagnostics(diags)
+		return 1
+	}
+
+	// Determine the graph type
+	graphType := terraform.GraphTypePlan
+	if plan != nil {
+		graphType = terraform.GraphTypeApply
+	}
+
+	if graphTypeStr != "" {
+		v, ok := terraform.GraphTypeMap[graphTypeStr]
+		if !ok {
+			c.Ui.Error(fmt.Sprintf("Invalid graph type requested: %s", graphTypeStr))
+			return 1
+		}
+
+		graphType = v
+	}
+
+	// Skip validation during graph generation - we want to see the graph even if
+	// it is invalid for some reason.
+	g, graphDiags := ctx.Graph(graphType, &terraform.ContextGraphOpts{
+		Verbose:  verbose,
+		Validate: false,
+	})
+
+	diags = diags.Append(graphDiags)
+	if graphDiags.HasErrors() {
+		c.showDiagnostics(diags)
+		return 1
+	}
+
+	// Copy-pasted until here from graph.
+
+	indexDiags := c.index(g)
 	diags = diags.Append(indexDiags)
 
-	return c.showResults(diags, jsonOutput)
+	return c.showResults(diags /*jsonOutput*/, true)
 }
 
-func (c *IndexCommand) index(dir string) tfdiags.Diagnostics {
+func (c *IndexCommand) index(g *terraform.Graph) tfdiags.Diagnostics {
 	// Note: execute the binary with TF_LOG=true env var to see logs.
 	// Otherwise they are only dumped to crash.log on crash.
 	log.Printf("[INFO] Index starting")
 	var diags tfdiags.Diagnostics
 
-	cfg, cfgDiags := c.loadConfig(dir)
-	diags = diags.Append(cfgDiags)
+	var mu sync.Mutex
 
-	if diags.HasErrors() {
-		return diags
-	}
+	g.AcyclicGraph.Walk(func(v dag.Vertex) tfdiags.Diagnostics {
+		// Lock so our log output is not messed.. could remove later or restrict to sensitive parts
+		mu.Lock()
+		defer mu.Unlock()
 
-	// Note: index input references, maybe from values files, if any?
+		log.Printf("[INFO] Index walking %v of type '%s'", v, reflect.TypeOf(v))
 
-	// Note: below is leftover from validate.go. If we don't need it, remove.
-	//
-	// "validate" is to check if the given module is valid regardless of
-	// input values, current state, etc. Therefore we populate all of the
-	// input values with unknown values of the expected type, allowing us
-	// to perform a type check without assuming any particular values.
-	varValues := make(terraform.InputValues)
-	for name, variable := range cfg.Module.Variables {
-		ty := variable.Type
-		if ty == cty.NilType {
-			// Can't predict the type at all, so we'll just mark it as
-			// cty.DynamicVal (unknown value of cty.DynamicPseudoType).
-			ty = cty.DynamicPseudoType
+		if refable, isRefable := v.(terraform.GraphNodeReferenceable); isRefable {
+			log.Printf("[INFO] Got a Referenceable in ModulePath:'%+v'", refable.ModulePath())
+
+			// HACK: Need this explicit check, since the root module, event thought Referenceable, will panic when we try to get a refable address
+			// (why doesn't it just return empty list, just like the doc says?).
+			isTheRootModule := reflect.TypeOf(v).String() == "*terraform.nodeCloseModule" && refable.ModulePath().IsRoot()
+			if !isTheRootModule {
+				// Relative to ModulePath:
+				log.Printf("[INFO] .. ReferenceableAddrs:[%+v]", refable.ReferenceableAddrs())
+			}
+			if !refable.ModulePath().IsRoot() {
+				log.Printf("[INFO] ..non-root, ancestors %+v", refable.ModulePath().Ancestors())
+				callerModule, call := refable.ModulePath().Call()
+				log.Printf("[INFO] ..(the containing module is called from module '%+v', with address '%+v')", callerModule, call)
+			}
 		}
-		varValues[name] = &terraform.InputValue{
-			Value:      cty.UnknownVal(ty),
-			SourceType: terraform.ValueFromCLIArg,
+
+		if refer, isRefer := v.(terraform.GraphNodeReferencer); isRefer {
+			log.Printf("[INFO] Is a Referencer, refs:")
+			for _, r := range refer.References() {
+				log.Printf("[INFO] ... subject '%v', sourceRange '%+v', traversalRange '%+v",
+					r.Subject, r.SourceRange, r.Remaining.SourceRange())
+				for _, t := range r.Remaining {
+					log.Printf("[INFO]   ... trav srcRange '%v' type '%s'", t.SourceRange(), reflect.TypeOf(t))
+				}
+			}
 		}
-	}
 
-	opts, err := c.contextOpts()
-	if err != nil {
-		diags = diags.Append(err)
-		return diags
-	}
-	opts.Config = cfg
-	opts.Variables = varValues
-
-	tfCtx, ctxDiags := terraform.NewContext(opts)
-	diags = diags.Append(ctxDiags)
-	if ctxDiags.HasErrors() {
-		return diags
-	}
-
-	///
-	for key, child := range cfg.Children {
-		log.Printf("[TRACE] child %s", key)
-		c.dumpModuleRefs(tfCtx, child)
-	}
-	///
+		var d tfdiags.Diagnostics
+		return d
+	})
 
 	return diags
 }
