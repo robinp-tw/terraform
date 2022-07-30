@@ -12,9 +12,9 @@ import (
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/terraform/configs"
 	"github.com/hashicorp/terraform/configs/configschema"
+	"github.com/hashicorp/terraform/lang"
 	"github.com/hashicorp/terraform/terraform"
 	"github.com/hashicorp/terraform/tfdiags"
-	"github.com/hashicorp/terraform/lang"
 )
 
 // IndexCommand is a Command implementation that emits crossreference data for Terraform files.
@@ -69,6 +69,9 @@ func (c *IndexCommand) Run(args []string) int {
 }
 
 func (c *IndexCommand) index(dir string) tfdiags.Diagnostics {
+	// Note: execute the binary with TF_LOG=true env var to see logs.
+	// Otherwise they are only dumped to crash.log on crash.
+	log.Printf("[INFO] Index starting")
 	var diags tfdiags.Diagnostics
 
 	cfg, cfgDiags := c.loadConfig(dir)
@@ -108,19 +111,23 @@ func (c *IndexCommand) index(dir string) tfdiags.Diagnostics {
 	opts.Config = cfg
 	opts.Variables = varValues
 
-	/*tfctx*/ _, ctxDiags := terraform.NewContext(opts)
+	tfCtx, ctxDiags := terraform.NewContext(opts)
 	diags = diags.Append(ctxDiags)
 	if ctxDiags.HasErrors() {
 		return diags
 	}
 
 	///
-	c.dumpModuleRefs(cfg.Children["kafka"])
+	for key, child := range cfg.Children {
+		log.Printf("[TRACE] child %s", key)
+		c.dumpModuleRefs(tfCtx, child)
+	}
 	///
+
 	return diags
 }
 
-func (c *IndexCommand) dumpModuleRefs(cfg *configs.Config) {
+func (c *IndexCommand) dumpModuleRefs(tfCtx *terraform.Context, cfg *configs.Config) {
 	// See transform_module_variable.go for inspiration.
 	_, call := cfg.Path.Call()
 	moduleCall, exists := cfg.Parent.Module.ModuleCalls[call.Name]
@@ -142,8 +149,8 @@ func (c *IndexCommand) dumpModuleRefs(cfg *configs.Config) {
 	}
 	for _, v := range cfg.Module.Variables {
 		schema.Attributes[v.Name] = &configschema.Attribute{
-			Required: v.Default == cty.NilVal,  // ?
-			Type: v.Type,
+			Required: v.Default == cty.NilVal, // ?
+			Type:     v.Type,
 		}
 	}
 
@@ -166,6 +173,36 @@ func (c *IndexCommand) dumpModuleRefs(cfg *configs.Config) {
 			log.Printf("[INFO] Ref: %+v", r)
 		}
 	}
+	// TODO count, for_each
+
+	// Resource refs
+	// See backend/local/backend_plan.go for inspiration.
+	//
+	// NOTE: we should extract refs for top-level resources only, not from
+	// child modules. Here we get from a child module just to experiment.
+	for rn, r := range cfg.Module.ManagedResources {
+		log.Printf("[INFO] Resource: %v -> %+v", rn, r)
+		s := tfCtx.Schemas().ProviderSchema(r.Provider)
+		if s == nil {
+			panic(fmt.Errorf("no schema for %s", r.Provider))
+		}
+		rSchema, _ := s.SchemaForResourceAddr(r.Addr())
+		if rSchema == nil {
+			panic(fmt.Errorf("no schema for resource %s with addr %v", r.Provider, r.Addr()))
+		}
+		log.Printf("[INFO] Schema: %+v", rSchema)
+		// TODO pass Config through the Content like above?
+		rRefs, rDiags := lang.ReferencesInBlock(r.Config, rSchema)
+		if rDiags.HasErrors() {
+			log.Printf("[INFO] Error while getting references from resource %s", r.Addr())
+		} else {
+			for _, r := range rRefs {
+				log.Printf("[INFO] ResRef: %+v", r)
+			}
+		}
+
+	}
+	// TODO count, for_each
 }
 
 func (c *IndexCommand) showResults(diags tfdiags.Diagnostics, jsonOutput bool) int {
