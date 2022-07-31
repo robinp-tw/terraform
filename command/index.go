@@ -9,10 +9,7 @@ import (
 
 	"github.com/zclconf/go-cty/cty"
 
-	"github.com/hashicorp/hcl/v2"
-	"github.com/hashicorp/terraform/configs"
-	"github.com/hashicorp/terraform/configs/configschema"
-	"github.com/hashicorp/terraform/lang"
+	"github.com/hashicorp/terraform/command/indexer"
 	"github.com/hashicorp/terraform/terraform"
 	"github.com/hashicorp/terraform/tfdiags"
 )
@@ -26,9 +23,9 @@ func (c *IndexCommand) Run(args []string) int {
 	// Note: mostly adapted from validate.go.
 	args = c.Meta.process(args)
 
-	var jsonOutput bool
+	jsonOutput := true
 	cmdFlags := c.Meta.defaultFlagSet("index")
-	cmdFlags.BoolVar(&jsonOutput, "json", false, "produce JSON output")
+	//cmdFlags.BoolVar(&jsonOutput, "json", false, "produce JSON output")
 	cmdFlags.Usage = func() { c.Ui.Error(c.Help()) }
 	if err := cmdFlags.Parse(args); err != nil {
 		c.Ui.Error(fmt.Sprintf("Error parsing command-line flags: %s\n", err.Error()))
@@ -81,7 +78,7 @@ func (c *IndexCommand) index(dir string) tfdiags.Diagnostics {
 		return diags
 	}
 
-	// Note: index input references, maybe from values files, if any?
+	// TODO(indexing): index input references, maybe from values files, if any?
 
 	// Note: below is leftover from validate.go. If we don't need it, remove.
 	//
@@ -117,98 +114,17 @@ func (c *IndexCommand) index(dir string) tfdiags.Diagnostics {
 		return diags
 	}
 
-	///
-	for key, child := range cfg.Children {
-		log.Printf("[TRACE] child %s", key)
-		c.dumpModuleRefs(tfCtx, child)
-	}
-	///
+	ixer := indexer.NewIndexer()
+	ixer.RecursivelyIndexModules(tfCtx, cfg)
 
 	return diags
-}
-
-func (c *IndexCommand) dumpModuleRefs(tfCtx *terraform.Context, cfg *configs.Config) {
-	// See transform_module_variable.go for inspiration.
-	_, call := cfg.Path.Call()
-	moduleCall, exists := cfg.Parent.Module.ModuleCalls[call.Name]
-	if !exists {
-		// Should not happen
-		panic(fmt.Errorf("no module call block found for %s", cfg.Path))
-	}
-	// Artificial schema
-	hclSchema := &hcl.BodySchema{}
-	for _, v := range cfg.Module.Variables {
-		hclSchema.Attributes = append(hclSchema.Attributes, hcl.AttributeSchema{
-			Name:     v.Name,
-			Required: v.Default == cty.NilVal,
-		})
-	}
-
-	schema := &configschema.Block{
-		Attributes: map[string]*configschema.Attribute{},
-	}
-	for _, v := range cfg.Module.Variables {
-		schema.Attributes[v.Name] = &configschema.Attribute{
-			Required: v.Default == cty.NilVal, // ?
-			Type:     v.Type,
-		}
-	}
-
-	ct, ctDiags := moduleCall.Config.Content(hclSchema)
-	if ctDiags.HasErrors() {
-		log.Printf("[INFO] Error while getting content from module call for %s", cfg.Path)
-	} else {
-		for _, v := range cfg.Module.Variables {
-			if cta, exists := ct.Attributes[v.Name]; exists {
-				log.Printf("[INFO] Content-att %v at %v / %v", cta.Name, cta.Range, cta.NameRange)
-			}
-		}
-	}
-
-	refs, diags := lang.ReferencesInBlock(moduleCall.Config, schema)
-	if diags.HasErrors() {
-		log.Printf("[INFO] Error while getting references from module call for %s", cfg.Path)
-	} else {
-		for _, r := range refs {
-			log.Printf("[INFO] Ref: %+v", r)
-		}
-	}
-	// TODO count, for_each
-
-	// Resource refs
-	// See backend/local/backend_plan.go for inspiration.
-	//
-	// NOTE: we should extract refs for top-level resources only, not from
-	// child modules. Here we get from a child module just to experiment.
-	for rn, r := range cfg.Module.ManagedResources {
-		log.Printf("[INFO] Resource: %v -> %+v", rn, r)
-		s := tfCtx.Schemas().ProviderSchema(r.Provider)
-		if s == nil {
-			panic(fmt.Errorf("no schema for %s", r.Provider))
-		}
-		rSchema, _ := s.SchemaForResourceAddr(r.Addr())
-		if rSchema == nil {
-			panic(fmt.Errorf("no schema for resource %s with addr %v", r.Provider, r.Addr()))
-		}
-		log.Printf("[INFO] Schema: %+v", rSchema)
-		// TODO pass Config through the Content like above?
-		rRefs, rDiags := lang.ReferencesInBlock(r.Config, rSchema)
-		if rDiags.HasErrors() {
-			log.Printf("[INFO] Error while getting references from resource %s", r.Addr())
-		} else {
-			for _, r := range rRefs {
-				log.Printf("[INFO] ResRef: %+v", r)
-			}
-		}
-
-	}
-	// TODO count, for_each
 }
 
 func (c *IndexCommand) showResults(diags tfdiags.Diagnostics, jsonOutput bool) int {
 	switch {
 	case jsonOutput:
-		c.Ui.Output("I'm json trust me")
+		// For now we stream out json directly. So let's not output anything.
+		//c.Ui.Output("{\"value\": \"I'm json trust me\"}")
 
 	default:
 		if len(diags) == 0 {
