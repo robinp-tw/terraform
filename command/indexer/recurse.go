@@ -31,26 +31,6 @@ func (se *someEmitter) EmitModuleIdentity(mi ModuleIdentity) {
 	fmt.Printf("{\"moduleIdentity\": \"%s\"}", mi.SourceReference)
 }
 
-// CanonicalModuleIdentity is a universal, normalized identity for a given Terraform module.
-// For example, in git-stored modules, this can be the repo + path, together with a branch
-// reference (though a commit hash is the most universal, and in fact should be used.. but
-// that might need some nontrivial lookup.. or should we defer canonical mapping to some
-// later stage?)
-//
-// Ok, see ModuleIdentity below then.
-type CanonicalModuleIdentity struct {
-}
-
-// ModuleIdentity is a good-enough, though maybe not exact or universal module identity.
-// For example, a given module might be referred to by local path (from other modules in
-// the same repo), gitty ref, or a direct http-based artifact reference.
-//
-// To be fleshed out. Might need some extra data like git module of referencer etc, so
-// there's better chance of canonicalizing later.
-type ModuleIdentity struct {
-	SourceReference string
-}
-
 func (ixer *Indexer) RecursivelyIndexModules(tfCtx *terraform.Context, cfg *configs.Config) {
 
 	// Notes:
@@ -75,39 +55,69 @@ func (ixer *Indexer) RecursivelyIndexModules(tfCtx *terraform.Context, cfg *conf
 	}
 	ixer.EmitModuleIdentity(identity)
 
-}
+	mAddr := cfg.Path
 
-func somethingAboutModuleCalls(cfg *configs.Config) {
-	// Stashing some code here. It goes upwards, from current module to caller,
-	// which doesn't make sense, but anyway.
-	_, call := cfg.Path.Call()
-	moduleCall, exists := cfg.Parent.Module.ModuleCalls[call.Name]
-	if !exists {
-		// Should not happen
-		panic(fmt.Errorf("no module call block found for %s", cfg.Path))
+	for _, v := range cfg.Module.Variables {
+		// Note: this prints the top-level variables definitions, but would be nice if we could also get hold of the deeper variables, in case
+		// the variable type is an object. Might need some HCL-y AST mining though.. also only useful if we can actually connect up
+		// the references from use-sites.
+
+		// Also see below in module call indexing, by default we can't get hold of the references to these, so emitting the
+		// definitions is pretty useless without that (but probably can be worked out, see comment there).
+		log.Printf("Var name='%s' in module '%s' in range '%v'", v.Name, mAddr, v.DeclRange)
 	}
 
-	// From here it can be generic.
+	for _, l := range cfg.Module.Locals {
+		log.Printf("Local name='%s' in module '%s' in range '%v'", l.Name, mAddr, l.DeclRange)
+		refs, _ := lang.ReferencesInExpr(l.Expr)
+		for _, ref := range refs {
+			log.Printf("Ref in local '%s' referencing '%s' from range '%v'", l.Name, ref.Subject.String(), ref.SourceRange)
+		}
+	}
 
-	hclSchema, schema := mkSyntheticSchema(cfg)
+	for _, o := range cfg.Module.Outputs {
+		log.Printf("Output name='%s' in module '%s' in range '%v'", o.Name, mAddr, o.DeclRange)
+		refs, _ := lang.ReferencesInExpr(o.Expr)
+		for _, ref := range refs {
+			log.Printf("Ref in output '%s' referencing '%s' from range '%v'", o.Name, ref.Subject.String(), ref.SourceRange)
+		}
+	}
+
+	for key, call := range cfg.Module.ModuleCalls {
+		log.Printf("ModuleCall in '%s', key '%s', name '%s', sourceAddr '%s', sourceAddrRange '%v', declRange '%v'", mAddr, key, call.Name, call.SourceAddr, call.SourceAddrRange, call.DeclRange)
+		somethingAboutModuleCalls(call, cfg.Children[key])
+	}
+
+	for _, childCfg := range cfg.Children {
+		ixer.RecursivelyIndexModules(tfCtx, childCfg)
+	}
+
+}
+
+func somethingAboutModuleCalls(moduleCall *configs.ModuleCall, calledConfig *configs.Config) {
+	hclSchema, schema := mkSyntheticSchema(calledConfig)
 
 	callContent, callContentDiags := moduleCall.Config.Content(hclSchema)
 	if callContentDiags.HasErrors() {
-		log.Printf("[INFO] Error while getting content from module call for %s", cfg.Path)
+		log.Printf("[INFO] Error while getting content from module call for %s", calledConfig.Path)
 	} else {
-		for _, v := range cfg.Module.Variables {
+		for _, v := range calledConfig.Module.Variables {
 			if cta, exists := callContent.Attributes[v.Name]; exists {
 				log.Printf("[INFO] Content-att %v at %v / %v", cta.Name, cta.Range, cta.NameRange)
 			}
 		}
 	}
 
+	// These are the refs from the expressions passed to the various parameters.
+
+	// We should also emit references to the actual variable definitions.
+	// Maybe blocktoattr.ExpandedVariables can serve as some inspiration?
 	refs, diags := lang.ReferencesInBlock(moduleCall.Config, schema)
 	if diags.HasErrors() {
-		log.Printf("[INFO] Error while getting references from module call for %s", cfg.Path)
+		log.Printf("[INFO] Error while getting references from module call for %s", calledConfig.Path)
 	} else {
 		for _, r := range refs {
-			log.Printf("[INFO] Ref: %+v", r)
+			log.Printf("[INFO] ModuleCall Ref: %+v", r)
 		}
 	}
 }
